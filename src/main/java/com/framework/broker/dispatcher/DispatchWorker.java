@@ -15,6 +15,12 @@ public class DispatchWorker implements Runnable {
     private final EventConsumer consumer;
     private final Event event;
 
+    private final Counter processedCounter;
+    private final Counter retryCounter;
+    private final Counter dlqCounter;
+    private final Timer processingTimer;
+
+
     private final OffsetManager offsetManager;
     private final RetryPolicy retryPolicy;
     private final ScheduledExecutorService retryScheduler;
