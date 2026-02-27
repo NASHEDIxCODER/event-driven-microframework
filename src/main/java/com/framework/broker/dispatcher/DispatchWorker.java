@@ -66,6 +66,8 @@ public class DispatchWorker implements Runnable {
         int attempt = Integer.parseInt(
                 event.getHeaders().getOrDefault("retryCount", "0")
         ) + 1;
+        System.out.println("Attempt=" + attempt +
+                " eventId=" + event.getId());
 
         try {
 

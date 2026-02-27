@@ -19,12 +19,18 @@ public class RetryHandler {
     }
 
     public Event createRetryEvent(Event event, int attempt) {
+
+        // Clone headers safely
+        java.util.Map<String, String> newHeaders =
+                new java.util.HashMap<>(event.getHeaders());
+
+        newHeaders.put("retryCount", String.valueOf(attempt));
+
         return Event.builder()
                 .id(event.getId())
                 .topic(event.getTopic())
                 .payload(event.getPayload())
-                .headers(event.getHeaders())
-                .header("retryCount", String.valueOf(attempt))
+                .headers(newHeaders)
                 .build();
     }
 }

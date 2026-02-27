@@ -19,10 +19,11 @@ public class Main {
         // 2️⃣ Register Consumer
         eventBus.subscribe("user-events", "consumer-1", payload -> {
 
-            EventTracer.trace("Received payload: " + payload);
+            String message = (String) payload;
 
-            // Simulate failure for retry test
-            if (payload.toString().contains("fail")) {
+            System.out.println("Processing: " + message);
+
+            if ("fail-event".equals(message)) {
                 throw new RuntimeException("Simulated failure");
             }
         });
