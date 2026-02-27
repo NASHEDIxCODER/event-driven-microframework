@@ -79,6 +79,7 @@ public class EventDispatcher {
                 .computeIfAbsent(topicName,
                         t -> new CopyOnWriteArrayList<>())
                 .add(consumer);
+        offsetManager.initializeConsumer(consumer.getConsumerId());
     }
 
     // ============================================
