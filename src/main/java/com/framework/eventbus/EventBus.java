@@ -1,31 +1,52 @@
 package com.framework.eventbus;
 
 import com.framework.broker.core.Event;
-import com.framework.broker.core.MessageBroker;
-import com.framework.broker.consumer.EventConsumer;
-import com.framework.broker.dispatcher.EventDispatcher;
-import com.framework.broker.core.Topic;
 
-public class BrokerAdapter {
+public class EventBus {
 
-    private final MessageBroker broker;
-    private final EventDispatcher dispatcher;
+    private final BrokerAdapter adapter;
+    private final EventSerializer serializer;
 
-    public BrokerAdapter(MessageBroker broker, EventDispatcher dispatcher) {
-        this.broker = broker;
-        this.dispatcher = dispatcher;
+    public EventBus(BrokerAdapter adapter,
+                    EventSerializer serializer) {
+        this.adapter = adapter;
+        this.serializer = serializer;
     }
 
-    public void createTopic(String topicName, int capacity) {
-        Topic topic = broker.createTopic(topicName);
-        dispatcher.start(topic);
+    public void createTopic(String topic, int capacity) {
+        adapter.createTopic(topic, capacity);
     }
 
-    public void publish(Event event) throws InterruptedException {
-        broker.publish(event);
+    public void publish(String topic, Object payload)
+            throws InterruptedException {
+
+        byte[] serialized = serializer.serialize(payload);
+
+        Event event = Event.builder()
+                .topic(topic)
+                .payload(serialized)
+                .build();
+
+        adapter.publish(event);
     }
 
-    public void subscribe(String topic, EventConsumer consumer) {
-        dispatcher.registerConsumer(topic, consumer);
+    public void subscribe(String topic,
+                          String consumerId,
+                          EventHandler handler) {
+
+        adapter.subscribe(topic, new com.framework.broker.consumer.EventConsumer() {
+
+            @Override
+            public String getConsumerId() {
+                return consumerId;
+            }
+
+            @Override
+            public void onEvent(com.framework.broker.core.Event event) throws Exception {
+                Object deserialized =
+                        serializer.deserialize(event.getPayload());
+                handler.handle(deserialized);
+            }
+        });
     }
 }

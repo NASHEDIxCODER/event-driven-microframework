@@ -1,136 +1,142 @@
 package com.framework.broker.dispatcher;
 
-import com.framework.broker.consumer.*;
-import com.framework.broker.core.*;
+import com.framework.broker.consumer.EventConsumer;
+import com.framework.broker.consumer.OffsetManager;
+import com.framework.broker.core.Event;
+import com.framework.broker.core.Topic;
 import com.framework.broker.dlq.DeadLetterQueue;
+import com.framework.broker.retry.RetryHandler;
 import com.framework.broker.retry.RetryPolicy;
+import com.framework.metrics.Counter;
+import com.framework.metrics.MetricRegistry;
+import com.framework.metrics.Timer;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 
 public class EventDispatcher {
 
-    private final ExecutorService workerPool;
-    private final ScheduledExecutorService retryScheduler =
-            Executors.newScheduledThreadPool(2);
+    private final DispatcherConfig config;
 
-    private final Map<String, ConsumerGroup> consumerGroups =
+    private final ExecutorService workerPool;
+    private final ScheduledExecutorService retryScheduler;
+
+    private final OffsetManager offsetManager = new OffsetManager();
+
+    private final RetryHandler retryHandler;
+
+    private final Map<String, List<EventConsumer>> consumers =
             new ConcurrentHashMap<>();
 
     private final Map<String, DeadLetterQueue> dlqRegistry =
             new ConcurrentHashMap<>();
 
-    private final OffsetManager offsetManager = new OffsetManager();
-    private final RetryPolicy retryPolicy =
-            new RetryPolicy(3, 1000, 2.0);
-
-    private volatile boolean running = false;
+    // Metrics
+    private final MetricRegistry metricRegistry = new MetricRegistry();
+    private final Counter processedCounter;
+    private final Counter retryCounter;
+    private final Counter dlqCounter;
+    private final Timer processingTimer;
 
     public EventDispatcher(DispatcherConfig config) {
+
+        this.config = config;
+
         this.workerPool =
                 Executors.newFixedThreadPool(config.getWorkerThreads());
-    }
 
-    public void registerConsumer(String topic, EventConsumer consumer) {
-        consumerGroups
-                .computeIfAbsent(topic, ConsumerGroup::new)
-                .addConsumer(consumer);
+        this.retryScheduler =
+                Executors.newScheduledThreadPool(2);
 
-        offsetManager.initializeConsumer(consumer.getConsumerId());
-    }
-
-    public void start(Topic topic) {
-        running = true;
-        Thread t = new Thread(() -> dispatchLoop(topic));
-        t.start();
-    }
-
-    private void dispatchLoop(Topic topic) {
-        while (running) {
-            try {
-                Event event = topic.consume();
-                ConsumerGroup group =
-                        consumerGroups.get(topic.getName());
-
-                if (group == null) continue;
-
-                for (EventConsumer consumer : group.getConsumers()) {
-                    workerPool.submit(
-                            new DispatchWorker(
-                                    topic.getName(),
-                                    consumer,
-                                    event,
-                                    offsetManager,
-                                    retryPolicy,
-                                    retryScheduler,
-                                    workerPool,
-                                    dlqRegistry
-                            )
-                    );
-                }
-
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private void processWithRetry(String topicName,
-                                  EventConsumer consumer,
-                                  Event event) {
-
-        int attempt = Integer.parseInt(
-                event.getHeaders().getOrDefault("retryCount", "0")
-        ) + 1;
-
-        try {
-            consumer.onEvent(event);
-            offsetManager.incrementOffset(consumer.getConsumerId());
-
-        } catch (Exception ex) {
-
-            if (attempt <= retryPolicy.getMaxAttempts()) {
-
-                long delay = retryPolicy.computeDelay(attempt);
-
-                Event retryEvent = Event.builder()
-                        .id(event.getId())
-                        .topic(event.getTopic())
-                        .payload(event.getPayload())
-                        .headers(event.getHeaders())
-                        .header("retryCount", String.valueOf(attempt))
-                        .build();
-
-                retryScheduler.schedule(() ->
-                                workerPool.submit(() ->
-                                        processWithRetry(topicName, consumer, retryEvent)),
-                        delay,
-                        TimeUnit.MILLISECONDS
+        this.retryHandler =
+                new RetryHandler(
+                        new RetryPolicy(3, 1000, 2.0)
                 );
 
-            } else {
-                sendToDlq(topicName, event);
+        // Initialize metrics once
+        this.processedCounter =
+                metricRegistry.counter("events.processed");
+
+        this.retryCounter =
+                metricRegistry.counter("events.retry");
+
+        this.dlqCounter =
+                metricRegistry.counter("events.dlq");
+
+        this.processingTimer =
+                metricRegistry.timer("events.processing.time");
+    }
+
+    // ============================================
+    // Register Consumer
+    // ============================================
+
+    public void registerConsumer(String topicName,
+                                 EventConsumer consumer) {
+
+        consumers
+                .computeIfAbsent(topicName,
+                        t -> new CopyOnWriteArrayList<>())
+                .add(consumer);
+    }
+
+    // ============================================
+    // Start Dispatching For Topic
+    // ============================================
+
+    public void start(Topic topic) {
+
+        new Thread(() -> {
+
+            while (!Thread.currentThread().isInterrupted()) {
+
+                try {
+
+                    Event event = topic.consume();
+                    String topicName = topic.getName();
+
+                    List<EventConsumer> topicConsumers =
+                            consumers.get(topicName);
+
+                    if (topicConsumers == null || topicConsumers.isEmpty()) {
+                        continue;
+                    }
+
+                    for (EventConsumer consumer : topicConsumers) {
+
+                        workerPool.submit(
+                                new DispatchWorker(
+                                        topicName,
+                                        consumer,
+                                        event,
+                                        offsetManager,
+                                        retryHandler,
+                                        retryScheduler,
+                                        workerPool,
+                                        dlqRegistry,
+                                        processedCounter,
+                                        retryCounter,
+                                        dlqCounter,
+                                        processingTimer
+                                )
+                        );
+                    }
+
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+
             }
-        }
+
+        }).start();
     }
 
-    private void sendToDlq(String topicName, Event event) {
-        try {
-            DeadLetterQueue dlq =
-                    dlqRegistry.computeIfAbsent(
-                            topicName,
-                            t -> new DeadLetterQueue(t, 1000)
-                    );
-
-            dlq.publish(event);
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
+    // ============================================
+    // Shutdown
+    // ============================================
 
     public void shutdown() {
-        running = false;
         workerPool.shutdown();
         retryScheduler.shutdown();
     }

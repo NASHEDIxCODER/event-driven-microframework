@@ -4,7 +4,9 @@ import com.framework.broker.consumer.EventConsumer;
 import com.framework.broker.consumer.OffsetManager;
 import com.framework.broker.core.Event;
 import com.framework.broker.dlq.DeadLetterQueue;
-import com.framework.broker.retry.RetryPolicy;
+import com.framework.broker.retry.RetryHandler;
+import com.framework.metrics.Counter;
+import com.framework.metrics.Timer;
 
 import java.util.Map;
 import java.util.concurrent.*;
@@ -15,35 +17,43 @@ public class DispatchWorker implements Runnable {
     private final EventConsumer consumer;
     private final Event event;
 
+    private final OffsetManager offsetManager;
+    private final RetryHandler retryHandler;
+    private final ScheduledExecutorService retryScheduler;
+    private final ExecutorService workerPool;
+    private final Map<String, DeadLetterQueue> dlqRegistry;
+
     private final Counter processedCounter;
     private final Counter retryCounter;
     private final Counter dlqCounter;
     private final Timer processingTimer;
 
-
-    private final OffsetManager offsetManager;
-    private final RetryPolicy retryPolicy;
-    private final ScheduledExecutorService retryScheduler;
-    private final ExecutorService workerPool;
-    private final Map<String, DeadLetterQueue> dlqRegistry;
-
     public DispatchWorker(String topicName,
                           EventConsumer consumer,
                           Event event,
                           OffsetManager offsetManager,
-                          RetryPolicy retryPolicy,
+                          RetryHandler retryHandler,
                           ScheduledExecutorService retryScheduler,
                           ExecutorService workerPool,
-                          Map<String, DeadLetterQueue> dlqRegistry) {
+                          Map<String, DeadLetterQueue> dlqRegistry,
+                          Counter processedCounter,
+                          Counter retryCounter,
+                          Counter dlqCounter,
+                          Timer processingTimer) {
 
         this.topicName = topicName;
         this.consumer = consumer;
         this.event = event;
         this.offsetManager = offsetManager;
-        this.retryPolicy = retryPolicy;
+        this.retryHandler = retryHandler;   // ✅ fixed
         this.retryScheduler = retryScheduler;
         this.workerPool = workerPool;
         this.dlqRegistry = dlqRegistry;
+
+        this.processedCounter = processedCounter;
+        this.retryCounter = retryCounter;
+        this.dlqCounter = dlqCounter;
+        this.processingTimer = processingTimer;
     }
 
     @Override
@@ -58,22 +68,28 @@ public class DispatchWorker implements Runnable {
         ) + 1;
 
         try {
+
+            long start = System.currentTimeMillis();
+
             consumer.onEvent(event);
+
+            long duration = System.currentTimeMillis() - start;
+
+            processingTimer.record(duration);
+            processedCounter.increment();
+
             offsetManager.incrementOffset(consumer.getConsumerId());
 
         } catch (Exception ex) {
 
-            if (attempt <= retryPolicy.getMaxAttempts()) {
+            retryCounter.increment();
 
-                long delay = retryPolicy.computeDelay(attempt);
+            if (retryHandler.shouldRetry(attempt)) {
 
-                Event retryEvent = Event.builder()
-                        .id(event.getId())
-                        .topic(event.getTopic())
-                        .payload(event.getPayload())
-                        .headers(event.getHeaders())
-                        .header("retryCount", String.valueOf(attempt))
-                        .build();
+                long delay = retryHandler.nextDelay(attempt);
+
+                Event retryEvent =
+                        retryHandler.createRetryEvent(event, attempt);
 
                 retryScheduler.schedule(() ->
                                 workerPool.submit(
@@ -82,10 +98,14 @@ public class DispatchWorker implements Runnable {
                                                 consumer,
                                                 retryEvent,
                                                 offsetManager,
-                                                retryPolicy,
+                                                retryHandler,
                                                 retryScheduler,
                                                 workerPool,
-                                                dlqRegistry
+                                                dlqRegistry,
+                                                processedCounter,
+                                                retryCounter,
+                                                dlqCounter,
+                                                processingTimer
                                         )
                                 ),
                         delay,
@@ -93,13 +113,16 @@ public class DispatchWorker implements Runnable {
                 );
 
             } else {
+                dlqCounter.increment();
                 sendToDlq(event);
             }
         }
     }
 
     private void sendToDlq(Event event) {
+
         try {
+
             DeadLetterQueue dlq =
                     dlqRegistry.computeIfAbsent(
                             topicName,
