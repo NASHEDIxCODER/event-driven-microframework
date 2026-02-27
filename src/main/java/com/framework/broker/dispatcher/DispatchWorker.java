@@ -83,6 +83,8 @@ public class DispatchWorker implements Runnable {
             offsetManager.incrementOffset(consumer.getConsumerId());
 
         } catch (Exception ex) {
+            System.out.println("EXCEPTION for eventId=" +
+                    event.getId() + " : " + ex);
 
             retryCounter.increment();
 
